@@ -4,7 +4,7 @@ const {version}=JSON.parse(readFileSync(new URL('./package.json',import.meta.url
 let commit=process.env.VERCEL_GIT_COMMIT_SHA||'';
 if(!commit){try{commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim();}catch{}}
 export default {
- outputFileTracingIncludes:{'/api/**/*':['./public/chinese.otf']},
+ outputFileTracingIncludes:{'/api/**/*':['./public/chinese.ttf']},
  env:{
   NEXT_PUBLIC_APP_VERSION:version,
   NEXT_PUBLIC_APP_COMMIT:commit.slice(0,7),

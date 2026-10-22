@@ -1,8 +1,9 @@
 'use client';
+import {translate} from '../../lib/i18n.mjs';
 import {forwardRef,useEffect,useImperativeHandle,useRef} from 'react';
 
 // Keep normalized strokes so rotating/resizing a phone never erases the signature.
-const SignaturePad=forwardRef(function SignaturePad(_,ref){
+const SignaturePad=forwardRef(function SignaturePad({language='zh'},ref){
   const canvas=useRef(null),strokes=useRef([]),pointer=useRef(null);
   function draw(){
     const c=canvas.current;if(!c)return;
@@ -24,6 +25,6 @@ const SignaturePad=forwardRef(function SignaturePad(_,ref){
   function start(e){if(pointer.current!==null||e.button!==0)return;e.preventDefault();pointer.current=e.pointerId;e.currentTarget.setPointerCapture(e.pointerId);strokes.current.push([point(e)]);draw();}
   function move(e){if(pointer.current!==e.pointerId)return;e.preventDefault();strokes.current.at(-1).push(point(e));draw();}
   function stop(e){if(pointer.current===e.pointerId)pointer.current=null;}
-  return <canvas ref={canvas} aria-label="客户签名区域" onPointerDown={start} onPointerMove={move} onPointerUp={stop} onPointerCancel={stop} onLostPointerCapture={stop}/>;
+  return <canvas ref={canvas} aria-label={translate('客户签名区域',language)} onPointerDown={start} onPointerMove={move} onPointerUp={stop} onPointerCancel={stop} onLostPointerCapture={stop}/>;
 });
 export default SignaturePad;

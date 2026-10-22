@@ -1,3 +1,6 @@
+import {translate} from '../../../lib/i18n.mjs';
+import {receiptOrders} from '../../../lib/orders.mjs';
+import {queryParcels,changeParcel} from '../../../lib/admin-parcels.mjs';
 import {importSummaries} from '../../../lib/import-summary.mjs';
 import {importBatchIdentity,replaceImportBatch} from '../../../lib/import-batch.mjs';
 import {hasAllowedOrigin} from '../../../lib/request-origin.mjs';
@@ -21,6 +24,8 @@ function selectedDate(value){return value==='undated'?null:parseDispatchDate(val
 const pending=(state,dealer,date)=>state.parcels.filter(p=>!p.delivery_id&&p.dealer===dealer&&p.dispatch_date===date).sort((a,b)=>a.id-b.id);
 
 async function handle(req,ctx){
+  const language=/^en\b/i.test(req.headers.get('accept-language')||'')?'en':'zh';
+  const reply=(value,status=200)=>json(value?.error?{...value,error:translate(value.error,language)}:value,status);
   try{
     const path=(await ctx.params).path.join('/'),method=req.method;
     if(method!=='GET'&&!hasAllowedOrigin(req))throw new AppError('请求来源无效',403);
@@ -43,23 +48,23 @@ async function handle(req,ctx){
         state.sessions.push({token:digest(token),user_id:u.id,expires:new Date(Date.now()+12*3600000).toISOString()});
         return {ok:true};
       });
-      if(result.error)return json({error:result.error},result.status);
+      if(result.error)return reply({error:result.error},result.status);
       const response=json({ok:true});response.headers.set('set-cookie',`session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200${process.env.NODE_ENV==='production'?'; Secure':''}`);return response;
     }
     const token=digest(req.headers.get('cookie')?.match(/(?:^|;\s*)session=([^;]+)/)?.[1]||'');
     const state=await store.read(),user=userFor(state,token);
     // Authorization is checked again inside every CAS mutation, including retries.
     const mutate=fn=>store.transact(s=>fn(s,userFor(s,token)));
-    if(path==='me'&&method==='GET')return json(publicUser(user));
+    if(path==='me'&&method==='GET')return reply(publicUser(user));
     if(path==='logout'&&method==='POST'){
       await mutate(s=>{s.sessions=s.sessions.filter(x=>x.token!==token);});const response=json({ok:true});response.headers.set('set-cookie','session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');return response;
     }
     if(path==='password'&&method==='POST'){
       const b=await req.json(),password=pinHash(String(b.pin));
-      await mutate((s,u)=>{if(!pinVerify(String(b.oldPin),u.password))throw new AppError('原密码错误');u.password=password;s.sessions=s.sessions.filter(x=>x.user_id!==u.id||x.token===token);});return json({ok:true});
+      await mutate((s,u)=>{if(!pinVerify(String(b.oldPin),u.password))throw new AppError('原密码错误');u.password=password;s.sessions=s.sessions.filter(x=>x.user_id!==u.id||x.token===token);});return reply({ok:true});
     }
     if(path==='users'){
-      admin(user);if(method==='GET')return json(state.users.map(publicUser));
+      admin(user);if(method==='GET')return reply(state.users.map(publicUser));
       if(!['POST','PATCH','DELETE'].includes(method))throw new AppError('不支持此操作',405);
       const b=await req.json();
       const password=method==='DELETE'?null:pinHash(String(b.pin));
@@ -79,9 +84,9 @@ async function handle(req,ctx){
           }else target.password=password;
           s.sessions=s.sessions.filter(x=>x.user_id!==target.id);
         }
-      });return json({ok:true});
+      });return reply({ok:true});
     }
-    if(path==='imports'&&method==='GET'){admin(user);return json(importSummaries(state));}
+    if(path==='imports'&&method==='GET'){admin(user);return reply(importSummaries(state));}
     if(path==='import'&&method==='POST'){
       admin(user);const form=await req.formData(),file=form.get('file');
       if(!file||typeof file.arrayBuffer!=='function'||file.size>4*1024*1024)throw new AppError('请选择不超过4MB的xlsx文件');
@@ -94,13 +99,18 @@ async function handle(req,ctx){
       const sourcePath=await store.writeFile('imports',bytes,'source.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       const result=await mutate((s,u)=>{
         admin(u);return replaceImportBatch(s,{...batch,parcels,source,sourcePath,username:u.username});
-      });return json(result);
+      });return reply(result);
     }
-    if(path==='parcels'&&method==='GET')return json(state.parcels.filter(p=>!p.delivery_id).sort((a,b)=>(b.dispatch_date||'').localeCompare(a.dispatch_date||'')||a.dealer.localeCompare(b.dealer)||a.id-b.id).map(p=>({...p,driver_name:p.scanner_name||null})));
+    if(path==='admin/parcels'){
+      admin(user);if(method==='GET')return reply(queryParcels(state,new URL(req.url).searchParams));
+      if(!['PATCH','DELETE'].includes(method))throw new AppError('不支持此操作',405);
+      const body=await req.json();return reply(await mutate((s,u)=>{admin(u);return changeParcel(s,body,method,u.username);}));
+    }
+    if(path==='parcels'&&method==='GET')return reply(state.parcels.filter(p=>!p.delivery_id).sort((a,b)=>(b.dispatch_date||'').localeCompare(a.dispatch_date||'')||a.dealer.localeCompare(b.dealer)||a.id-b.id).map(p=>({...p,driver_name:p.scanner_name||null})));
     if(path==='scan'&&method==='POST'){
       const b=await req.json(),date=selectedDate(b.dispatchDate);
       if(typeof b.dealer!=='string'||!b.dealer)throw new AppError('请先选择发货日期和Dealer');
-      return json(await mutate((s,u)=>{const p=pending(s,b.dealer,date).find(p=>p.id===Number(b.id));if(!p)throw new AppError('托盘已提交或不存在');if(!p.scanned_at){p.scanned_at=new Date().toISOString();p.driver_id=u.id;p.scanner_name=u.username;}return {...p};}));
+      return reply(await mutate((s,u)=>{const p=pending(s,b.dealer,date).find(p=>p.id===Number(b.id));if(!p)throw new AppError('托盘已提交或不存在');if(!p.scanned_at){p.scanned_at=new Date().toISOString();p.driver_id=u.id;p.scanner_name=u.username;}return {...p};}));
     }
     if(path==='submit'&&method==='POST'){
       const b=await req.json(),dispatchDate=selectedDate(b.dispatchDate);
@@ -111,28 +121,37 @@ async function handle(req,ctx){
         if(JSON.stringify(rows.map(r=>r.id))!==JSON.stringify(b.ids))throw new AppError('托盘列表已变化，请刷新后重新确认');
         if(rows.some(r=>!r.scanned_at)&&b.confirmMissing!==true)throw new AppError('仍有未扫描托盘，请明确确认派送失败');
         const time=new Date(),name=filename(b.dealer,time,process.env.APP_TIMEZONE||'Australia/Sydney');
-        const pdf=await makePdf(b.dealer,rows,b.signature,u.username,time);
+        const receiptLanguage=b.language==='en'?'en':b.language==='zh'?'zh':language;
+        const pdf=await makePdf(b.dealer,rows,b.signature,u.username,time,receiptLanguage);
+        const snapshotPath=await store.writeFile('receipt-data',Buffer.from(JSON.stringify({dealer:b.dealer,rows,signature:b.signature,driver:u.username,time:time.toISOString()})),'receipt.json','application/json');
         const pdfPath=await store.writeFile('receipts',pdf,name,'application/pdf');
         const id=++s.counters.deliveries;
-        s.deliveries.push({id,dealer:b.dealer,dispatch_date:dispatchDate,driver_id:u.id,driver_name:u.username,created_at:time.toISOString(),filename:name,pdf_path:pdfPath,batch_keys:[...new Set(rows.map(p=>p.batch_key).filter(Boolean))]});
+        s.deliveries.push({id,dealer:b.dealer,dispatch_date:dispatchDate,driver_id:u.id,driver_name:u.username,created_at:time.toISOString(),filename:name,pdf_path:pdfPath,snapshot_path:snapshotPath,language:receiptLanguage,order_nos:receiptOrders(rows),batch_keys:[...new Set(rows.map(p=>p.batch_key).filter(Boolean))]});
         for(const p of rows)p.delivery_id=id;
         return {id,filename:name};
-      });return json(result);
+      });return reply(result);
     }
-    if(path==='deliveries'&&method==='GET')return json(state.deliveries.filter(d=>user.role==='admin'||d.driver_id===user.id).sort((a,b)=>b.id-a.id).slice(0,200).map(({pdf_path,...d})=>d));
+    if(path==='deliveries'&&method==='GET')return reply(state.deliveries.filter(d=>user.role==='admin'||d.driver_id===user.id).sort((a,b)=>b.id-a.id).map(({pdf_path,snapshot_path,...d})=>({...d,order_nos:d.order_nos??receiptOrders(state.parcels.filter(p=>p.delivery_id===d.id)),has_snapshot:!!snapshot_path})));
     if(/^pdf\/\d+$/.test(path)&&method==='GET'){
       const d=state.deliveries.find(d=>d.id===Number(path.split('/')[1])&&(user.role==='admin'||d.driver_id===user.id));
-      if(!d)throw new AppError('文件不存在',404);const object=await store.readFile(d.pdf_path);if(!object)throw new AppError('签收PDF暂时不可用，请联系管理员',503);
-      return new Response(new Uint8Array(object.body),{headers:{'Content-Type':'application/pdf','Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(d.filename)}`,'Cache-Control':'private, no-store'}});
+      if(!d)throw new AppError('文件不存在',404);
+      const params=new URL(req.url).searchParams,requestedLanguage=params.get('lang');
+      let object;
+      if(d.snapshot_path&&['zh','en'].includes(requestedLanguage)&&requestedLanguage!==d.language){
+        const data=await store.readFile(d.snapshot_path);if(!data)throw new AppError('签收PDF暂时不可用，请联系管理员',503);
+        const snapshot=JSON.parse(Buffer.from(data.body).toString('utf8'));
+        object={body:await makePdf(snapshot.dealer,snapshot.rows,snapshot.signature,snapshot.driver,new Date(snapshot.time),requestedLanguage)};
+      }else object=await store.readFile(d.pdf_path);if(!object)throw new AppError('签收PDF暂时不可用，请联系管理员',503);
+      return new Response(new Uint8Array(object.body),{headers:{'Content-Type':'application/pdf','Content-Disposition':`${params.get('inline')==='1'?'inline':'attachment'}; filename*=UTF-8''${encodeURIComponent(d.filename)}`,'Cache-Control':'private, no-store'}});
     }
     throw new AppError('接口不存在',404);
   }catch(error){
     // Never expose SDK error messages: storage URLs/tokens may be included.
-    if(error instanceof AppError)return json({error:error.message,...(error.code?{code:error.code}:{})},error.status);
-    if(error instanceof ValidationError)return json({error:error.message},400);
+    if(error instanceof AppError)return reply({error:error.message,...(error.code?{code:error.code}:{})},error.status);
+    if(error instanceof ValidationError)return reply({error:error.message},400);
     console.error('Request failed:',error.name);
-    if(error instanceof BlobError||(error instanceof TypeError&&error.message==='fetch failed'))return json({error:'Blob 存储访问失败，请检查私有存储连接、Token 和服务配额'},503);
-    return json({error:'操作失败，请检查日期、Excel或签名文件是否有效'},400);
+    if(error instanceof BlobError||(error instanceof TypeError&&error.message==='fetch failed'))return reply({error:'Blob 存储访问失败，请检查私有存储连接、Token 和服务配额'},503);
+    return reply({error:'操作失败，请检查日期、Excel或签名文件是否有效'},400);
   }
 }
 export const GET=handle;export const POST=handle;export const PATCH=handle;export const DELETE=handle;
