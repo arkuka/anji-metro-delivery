@@ -1,3 +1,4 @@
+import {importBatchIdentity,replaceImportBatch} from '../../../lib/import-batch.mjs';
 import {hasAllowedOrigin} from '../../../lib/request-origin.mjs';
 import {getStore,AppError,digest} from '../../../lib/storage.mjs';
 import {pinHash,pinVerify,rowsToParcels,filename,parseDispatchDate,ValidationError} from '../../../lib/domain.mjs';
@@ -84,15 +85,13 @@ async function handle(req,ctx){
       if(!file||typeof file.arrayBuffer!=='function'||file.size>4*1024*1024)throw new AppError('请选择不超过4MB的xlsx文件');
       const bytes=Buffer.from(await file.arrayBuffer()),wb=new ExcelJS.Workbook();await wb.xlsx.load(bytes);
       const sheet=wb.worksheets[0];if(!sheet)throw new AppError('工作簿为空');
-      const cell=sheet.getCell('C2'),dispatchDate=parseDispatchDate(cell.type===ExcelJS.ValueType.Formula?cell.result:cell.value,wb.properties.date1904);
+      const cell=sheet.getCell('C2');
+      const batch=importBatchIdentity(cell.type===ExcelJS.ValueType.Formula?cell.result:cell.value,sheet.getCell('G3').text,wb.properties.date1904);
       const rows=[];for(let i=1;i<=sheet.rowCount;i++)rows.push(Array.from({length:8},(_,j)=>sheet.getRow(i).getCell(j+1).text));
       const parcels=rowsToParcels(rows),source=digest(bytes);
       const sourcePath=await store.writeFile('imports',bytes,'source.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       const result=await mutate((s,u)=>{
-        admin(u);let inserted=0;const keys=new Set(s.parcels.map(p=>JSON.stringify([p.dispatch_date,p.load_no,p.pallet])));
-        for(const p of parcels){const key=JSON.stringify([dispatchDate,p.load,p.pallet]);if(keys.has(key))continue;keys.add(key);s.parcels.push({id:++s.counters.parcels,sequence:p.sequence,dealer:p.dealer,pallet:p.pallet,order_no:p.order,area:p.area,address:p.address,load_no:p.load,dispatch_date:dispatchDate,scanned_at:null,driver_id:null,scanner_name:null,delivery_id:null});inserted++;}
-        if(!s.imports.some(x=>x.source===source))s.imports.push({source,pathname:sourcePath,dispatch_date:dispatchDate,uploaded_by:u.username,uploaded_at:new Date().toISOString()});
-        return {dispatchDate,inserted,skipped:parcels.length-inserted};
+        admin(u);return replaceImportBatch(s,{...batch,parcels,source,sourcePath,username:u.username});
       });return json(result);
     }
     if(path==='parcels'&&method==='GET')return json(state.parcels.filter(p=>!p.delivery_id).sort((a,b)=>(b.dispatch_date||'').localeCompare(a.dispatch_date||'')||a.dealer.localeCompare(b.dealer)||a.id-b.id).map(p=>({...p,driver_name:p.scanner_name||null})));
@@ -113,7 +112,7 @@ async function handle(req,ctx){
         const pdf=await makePdf(b.dealer,rows,b.signature,u.username,time);
         const pdfPath=await store.writeFile('receipts',pdf,name,'application/pdf');
         const id=++s.counters.deliveries;
-        s.deliveries.push({id,dealer:b.dealer,dispatch_date:dispatchDate,driver_id:u.id,driver_name:u.username,created_at:time.toISOString(),filename:name,pdf_path:pdfPath});
+        s.deliveries.push({id,dealer:b.dealer,dispatch_date:dispatchDate,driver_id:u.id,driver_name:u.username,created_at:time.toISOString(),filename:name,pdf_path:pdfPath,batch_keys:[...new Set(rows.map(p=>p.batch_key).filter(Boolean))]});
         for(const p of rows)p.delivery_id=id;
         return {id,filename:name};
       });return json(result);
