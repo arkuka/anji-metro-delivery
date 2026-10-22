@@ -1,3 +1,4 @@
+import {importSummaries} from '../../../lib/import-summary.mjs';
 import {importBatchIdentity,replaceImportBatch} from '../../../lib/import-batch.mjs';
 import {hasAllowedOrigin} from '../../../lib/request-origin.mjs';
 import {getStore,AppError,digest} from '../../../lib/storage.mjs';
@@ -80,6 +81,7 @@ async function handle(req,ctx){
         }
       });return json({ok:true});
     }
+    if(path==='imports'&&method==='GET'){admin(user);return json(importSummaries(state));}
     if(path==='import'&&method==='POST'){
       admin(user);const form=await req.formData(),file=form.get('file');
       if(!file||typeof file.arrayBuffer!=='function'||file.size>4*1024*1024)throw new AppError('请选择不超过4MB的xlsx文件');

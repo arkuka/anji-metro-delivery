@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import {chromium} from 'playwright-core';
+import ExcelJS from 'exceljs';
 import {mkdtemp,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
@@ -34,6 +35,22 @@ try{
   await submit(page);await page.getByRole('button',{name:'正在登录…'}).waitFor();check(await page.getByRole('button',{name:'正在登录…'}).isDisabled(),'login progress visible and duplicate clicks disabled');release();
   await dashboard(page);check(await page.getByRole('button',{name:'用户管理',exact:true}).count()===0,'driver has no admin navigation');check(await page.getByText('新增用户',{exact:true}).count()===0,'old administrator panel cleared');
   const role=await page.evaluate(()=>fetch('/api/me').then(r=>r.json()).then(u=>u.role));check(role==='driver','new account authenticated as driver');
+  if(width===390){
+   await page.getByText('暂无待派送托盘，请管理员确认 Excel 已导入成功；已签收的托盘不在此列表中。',{exact:true}).waitFor();
+   const operator=await browser.newContext();await operator.request.post(base+'/api/login',{data:{username:'browseradmin',pin:'0123'}});
+   async function upload(date){const wb=new ExcelJS.Workbook(),sheet=wb.addWorksheet('Dispatch');sheet.getCell('C2').value=date;sheet.getCell('G3').value='BROWSER-SYNC';sheet.getRow(9).values=['1','SYNC-DEALER','1','SYNC-PALLET','ORDER','区','地址','LOAD'];const response=await operator.request.post(base+'/api/import',{multipart:{file:{name:'sync.xlsx',mimeType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',buffer:Buffer.from(await wb.xlsx.writeBuffer())}}});check(response.ok(),'another administrator imported dispatch data');}
+   await upload('2026-10-22');
+   await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+   await page.waitForFunction(()=>document.querySelector('select[aria-label="发货日期"]')?.value==='2026-10-22');check(true,'foreground refresh discovers new data and automatically selects single date');
+   await upload('2026-10-23');await page.getByRole('button',{name:'刷新派送数据',exact:true}).click();
+   await page.locator('select[aria-label="发货日期"] option[value="2026-10-23"]').waitFor({state:'attached'});check(true,'manual refresh adds imported dates without logging out');
+   await page.route('**/api/parcels',route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'模拟存储连接失败'})}),{times:1});
+   await page.getByRole('button',{name:'刷新派送数据',exact:true}).click();await page.getByRole('alert').filter({hasText:'派送数据加载失败'}).waitFor();check(await page.locator('select[aria-label="发货日期"] option').count()===3,'failed refresh retains previously loaded dates');
+   await page.getByRole('button',{name:'刷新派送数据',exact:true}).click();await page.getByRole('alert').filter({hasText:'派送数据加载失败'}).waitFor({state:'hidden'});
+   await page.getByRole('button',{name:'签收记录',exact:true}).click();await page.getByRole('heading',{name:'已完成签收',exact:true}).waitFor();await upload('2026-10-24');await page.getByRole('button',{name:'派送工作台',exact:true}).click();
+   await page.locator('select[aria-label="发货日期"] option[value="2026-10-24"]').waitFor({state:'attached'});check(true,'returning to workbench refreshes dates');
+   const audit=await (await operator.request.get(base+'/api/imports')).json();check(audit.length===3&&audit.every(i=>i.pallet_count===1&&i.pending_count===1),'administrator audit confirms committed rows');await operator.close();
+  }
   await page.reload();await dashboard(page);
   await page.getByRole('button',{name:'签收记录',exact:true}).click();await page.getByRole('heading',{name:'已完成签收',exact:true}).waitFor();
   await logout(page);await fillLogin(page,'browseradmin','0123');await submit(page);await dashboard(page);
@@ -45,7 +62,7 @@ try{
   await page.route('**/api/me',route=>route.fulfill({status:401,contentType:'application/json',body:JSON.stringify({error:'请先登录'})}),{times:1});await submit(page);await page.locator('main [role="alert"]').filter({hasText:'浏览器未保存会话'}).waitFor();check(await page.locator('main [role="alert"]').isVisible(),'missing session has actionable feedback');
   check(errors.length===0,'no unhandled browser exceptions');await context.close();
  }
- console.log(`PASS: ${checks} browser login assertions (phone and desktop, create user, logout/login role switching, visible validation/loading/network/session feedback).`);
+ console.log(`PASS: ${checks} browser login assertions (phone and desktop, create user, logout/login role switching, dispatch sync after administrator import, visible validation/loading/network/session feedback).`);
 }catch(error){console.error('Application logs:',logs);throw error;}finally{
  await browser?.close();app.kill('SIGTERM');await Promise.race([new Promise(r=>app.once('exit',r)),pause(3000)]);if(app.exitCode===null)app.kill('SIGKILL');await rm(directory,{recursive:true,force:true});
 }

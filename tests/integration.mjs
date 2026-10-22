@@ -27,6 +27,7 @@ try{
  for(const username of ['driver1','driver2'])check((await request('users',{cookie:admin,body:{username,pin:'4567',role:'driver'}})).ok,'create driver');
  const driver=await login('driver1','4567'),other=await login('driver2','4567');
  check((await request('users',{cookie:driver})).status===403,'driver cannot manage accounts');
+ check((await request('imports',{cookie:driver})).status===403,'driver cannot read administrator import audit');
  check((await request('import',{cookie:driver,body:await workbook('2026-10-22')})).status===403,'driver cannot import');
  for(const date of [null,'2026-02-30'])check((await request('import',{cookie:admin,body:await workbook(date)})).status===400,'invalid Excel C2 rejected');
  const imported=await Promise.all([1,2].map(async()=>{const r=await request('import',{cookie:admin,body:await workbook('2026-10-22')});check(r.ok,'concurrent import succeeded');return r.json();}));
@@ -47,6 +48,7 @@ try{
  const state=await stored(),saved=state.deliveries.find(d=>d.id===receipt.id);check(saved.dispatch_date==='2026-10-22','receipt stores dispatch date');
  check(state.parcels.filter(p=>p.dispatch_date==='2026-10-23').every(p=>!p.scanned_at&&!p.delivery_id),'next date unaffected');
  check(state.imports.length===2,'source Excel indexes persisted');
+ const importsAudit=await (await request('imports',{cookie:admin})).json();check(importsAudit.length===2&&importsAudit.every(i=>i.pallet_count===2),'import audit reports actual committed pallet counts');check(importsAudit.find(i=>i.dispatch_date==='2026-10-22').pending_count===0&&importsAudit.find(i=>i.dispatch_date==='2026-10-23').pending_count===2,'import audit distinguishes signed and pending batches');
  check((await readFile(join(directory,saved.pdf_path))).subarray(0,4).toString()==='%PDF','PDF exists separately from JSON state');
  r=await request('pdf/'+receipt.id,{cookie:driver});check(r.ok&&r.headers.get('content-type')==='application/pdf','owner PDF download');check(Buffer.from(await r.arrayBuffer()).subarray(0,4).toString()==='%PDF','download is actual PDF');
  check((await request('pdf/'+receipt.id)).status===401,'PDF requires login');check((await request('pdf/'+receipt.id,{cookie:other})).status===404,'another driver cannot download PDF');
