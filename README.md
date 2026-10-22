@@ -1,62 +1,60 @@
-# 安吉包裹派送签收
+# 安吉包裹派送签收 · Vercel Blob 版
 
-Next.js 应用，部署到 Vercel；PostgreSQL 保存用户、扫码时间、派送记录与 PDF（二进制数据，无需依赖 Vercel 临时文件系统）。移动端支持摄像头，桌面支持扫码枪或手动输入。摄像头需要 HTTPS 和浏览器权限。
+Next.js 应用，使用 **Private Vercel Blob Store** 持久保存用户密码哈希、会话、包裹、扫描记录、原始 Excel 和签名 PDF。Vercel Blob 是云对象存储；Vercel 函数的本地目录不会用于正式数据保存。运行应用不再需要 Neon、PostgreSQL 或 `DATABASE_URL`。
 
-## 本地运行
+## 在 Vercel 配置
 
-需要 Node.js 22 或更新版本、PostgreSQL 16 或更新版本。
+1. 打开 Vercel 项目 → **Storage → Create Database / Create Store → Blob**，访问级别选择 **Private**，连接到本项目。界面名称可能略有差异。已有 Public Blob Store 不适合保存密码哈希、客户地址和签名，请创建 Private Store。
+2. 在 **Settings → Environment Variables** 确认连接生成了 **`BLOB_READ_WRITE_TOKEN`**。Token 只在服务端使用，不要加 `NEXT_PUBLIC_` 前缀，不要发送到聊天或提交到 GitHub。
+3. 添加 **`ADMIN_USERNAME`**（例如 `admin`）和 **`ADMIN_PIN`**（自行设置4位数字）。首次访问 API 时自动初始化管理员，后续部署不会覆盖已有密码。管理员初始化后可以移除 `ADMIN_PIN`；如果删除业务状态或换新 Store/前缀，初始化时需重新提供。
+4. 建议设置 **`BLOB_PREFIX=anji-delivery/production/v1`**；预览环境使用不同的 Store 或前缀，例如 `anji-delivery/preview/v1`。同一前缀的数据会跨部署保留。可选 `APP_TIMEZONE=Australia/Sydney` 控制 PDF 文件名时区。
+5. 部署框架 **Next.js**；安装 `npm ci`，构建 `npm run build`。保存变量后 **Deployments → 最新部署 → ⋯ → Redeploy**。
+6. 登录后导入 Excel，依次选择 **发货日期 → Dealer ID → 扫描托盘号**，客户签名后提交，检查 PDF 下载。摄像头必须使用 HTTPS 并允许权限。
 
-1. `npm ci --cache /workspace/.npm-cache`
-2. 将 `.env.example` 复制为 `.env.local`，安全填写 `DATABASE_URL`、`ADMIN_PIN`（4位数字），可更改 `ADMIN_USERNAME` 和 `APP_TIMEZONE`（默认 Australia/Sydney）。数据库服务提供的 TLS 连接字符串请原样保留，不要关闭证书校验。
-3. `node --env-file=.env.local scripts/setup.mjs`：初始化表和管理员，已有用户的密码不会被覆盖。
-4. `npm run dev`。生产模式使用 `npm run build` 和 `npm start`。
-5. `npm test` 运行核心逻辑测试。`DATABASE_URL=... node tests/integration.mjs` 在专用空白测试数据库中验证完整流程（会创建测试账号与业务数据，不用于生产数据库）。
+新 Store 默认没有旧业务数据。若原 Neon 数据库已有记录，先按照下面的迁移步骤迁移，再让应用使用该 Blob 前缀。新版本不再执行数据库建表或日期字段迁移。此代码库不会自动创建 Vercel Store、添加 Token 或发布到 Vercel。Blob 的免费额度和费用以账号控制台为准。
 
-## Vercel 部署
+## 数据保存和并发
 
-1. 将项目代码推送到 GitHub，将此仓库导入您的 Vercel 项目，框架选择 Next.js。构建命令 `npm run build`，安装命令 `npm ci`。
-2. 创建持久 PostgreSQL 数据库（例如 Neon 或 Vercel Marketplace 提供的服务），在 Vercel 的 Production / Preview 环境安全填写 `DATABASE_URL`。建议为预览和生产分别配置数据库。
-3. 在受信任的本地或云终端设置数据库连接和初始管理员用户名/PIN，执行 `npm run db:setup`。`ADMIN_PIN` 仅用于初始化，不需要留在 Vercel 运行环境。
-4. 可设置 `APP_TIMEZONE=Australia/Sydney`，用于 PDF 文件名；数据库时间以 UTC 保存，页面按浏览器时区显示。
-5. 部署完成后验证登录、导入、扫描、客户签名和下载 PDF。不要在聊天中发送 Vercel 密码或数据库凭据。项目尚未自动发布。
+- `<BLOB_PREFIX>/state.json` 是私有的业务状态，包含用户、会话、包裹、导入索引和签收索引。
+- `imports/<内容哈希>/source.xlsx` 保存原始 Excel；`receipts/<内容哈希>/<文件名>` 保存签名 PDF。全部是私有对象，浏览器通过鉴权 API 下载 PDF，无法直接访问业务 JSON。
+- 每次状态读取使用 SDK `get(..., {access:'private',useCache:false})` 从源站获取最新 ETag。写入使用 `put(...,{ifMatch:etag})`；新状态使用 `allowOverwrite:false`，并发冲突会重读并重试，超过上限返回409。整个扫描/签收事务在一个状态对象中提交，不会静默覆盖其他司机的记录。写入响应丢失时使用提交标识防止重复执行。
+- PDF 先上传成功，才提交签收索引与托盘状态。若上传失败，托盘不变；上传成功但状态冲突/失败，可能留下未引用的私有文件，不会生成错误的签收记录。备份或清理时须按 `state.json` 引用核对，不能按文件名盲删。
+- 这是面向小型派送团队的方案，每次修改需读写完整状态，操作量和费用随数据量增长。业务 JSON 上限20MB，PDF 和 Excel 独立存储；历史数据较多时需备份归档。操作密集时可能要求用户重试，不能保证任意并发量都能立即完成。
 
-## 工作流程
+## 功能与 Excel 格式
 
-- 管理员：导入 `.xlsx` 文件第一个工作表，C2 填写本文件托盘的发货日期，数据从第9行开始。日期支持 Excel 日期单元格、`YYYY-MM-DD`、`DD/MM/YYYY`（日/月/年）及 `YYYY年MM月DD日`；无效或空日期拒绝整份导入。A–H列：托盘序号、Dealer ID、托盘个数、托盘号、订单号、区、地址、装车单号。C列是参考值，实际进度以有效托盘行数为准。请将有前导零的编号在 Excel 中保存为文本。
-- 单次上传最多 4MB（适配 Vercel 请求大小限制）。不支持旧版 `.xls`。同一发货日期内相同装车单号 + 托盘号跳过，不覆盖已有信息；同批文件内重复会拒绝整批。
-- 司机：先选择发货日期，再选择该日期的 Dealer，扫描托盘号；订单号仅在该 Dealer 内唯一匹配时可代替托盘号。扫描记录包含服务器时间和司机。相同发货日期和 Dealer 的所有未提交托盘作为一批签收，请在当批文件导入完毕后开始派送。
-- 全部扫描后自动提示客户签名；缺少托盘时也可签名，但必须额外确认，PDF 将缺少项标为派送失败。
-- PDF 在服务端生成、事务保存，包含发货日期、托盘号、订单号、装车单号、结果、扫描时间、司机及客户签名。命名 `YYYYMMDD-HH:MM:SS-Dealer ID.PDF`；下载工具可能将冒号替换为适合本地文件系统的字符。
-- 司机可下载自己提交的记录，管理员可查看全部记录。提交后锁定托盘，不可重复提交。后台保留原扫描人，即使账号被删除也保留时间和已生成 PDF。
-- 管理员增删用户、重置密码；所有用户可以修改自己的密码。密码使用带随机盐的 scrypt 哈希，登录失败5次后锁定该用户名15分钟；会话12小时，HttpOnly Cookie。重置密码使该用户现有会话失效。
+- 管理员增删用户、重置密码；普通用户修改自己的密码。4位数字密码使用带随机盐的 scrypt 哈希；同一用户名连续失败5次锁定15分钟；会话12小时，HttpOnly Cookie。重置密码使该用户现有会话失效。
+- 接受 `.xlsx`，不支持旧 `.xls`；最大4MB。第一个工作表的 **C2 为发货日期**，包裹从第9行开始。日期支持 Excel 日期、`YYYY-MM-DD`、`DD/MM/YYYY`（日/月/年）或 `YYYY年MM月DD日`，空/无效日期拒绝整份文件。
+- A–H列：托盘序号、Dealer ID、托盘个数、托盘号、订单号、区、地址、装车单号。C列是参考值，扫描进度按有效托盘行数计算。包含前导零的编号请在 Excel 中保存为文本。
+- 同一发货日期 + 装车单号 + 托盘号重复导入会跳过，不覆盖扫描记录；文件内重复托盘拒绝整批。
+- 按发货日期和 Dealer 分组扫描、签收。订单号仅在该组内唯一匹配时可代替托盘号。未找到托盘必须额外确认，以派送失败记录并生成签名 PDF。
+- PDF 包含发货日期、托盘号、结果、订单号、装车单号、扫描时间、司机和签名；命名 `YYYYMMDD-HH:MM:SS-Dealer ID.PDF`。浏览器可能替换文件名中的冒号。扫描时间以 UTC 保存，页面使用浏览器时区。
+- 提交后托盘锁定。司机可下载自己的记录，管理员可查看全部记录。删除司机账号保留扫码姓名和历史签收。迁移的无日期旧包裹归入“未标注日期（历史数据）”。
 
-签名 PDF 可能含客户个人信息，请为生产数据库配置访问权限、备份和适合业务的保留期限。4位数字密码按需求实现，建议仅供内部派送使用。中文字体使用 Noto Sans CJK SC，许可见 `public/FONT-LICENSE.txt`。
+## 本地开发与验证
 
-## 此项目的 Neon 配置
-
-已生成本地 `.neon` 项目上下文和 `neon.ts`（仅 PostgreSQL，保留应用现有账号体系）。目标为组织 `org-spring-fire-16608068`、项目 `crimson-dawn-77427505`、分支 `production`。项目级 `.codex/config.toml` 配置 Neon MCP OAuth，并限定到此项目；OAuth 授权需要在支持该配置的 Codex 客户端完成，新配置不会自动加载到已运行的聊天工具中。
-
-本云环境全局目录不可写，使用 `npm_config_cache=/workspace/.npm-cache npx --yes neon@latest` 代替全局 `neon` 命令，并附加 `--config-dir /workspace/.neon-cli`。该目录在仓库外，不应提交。需要允许访问 `neon.com` 和 `*.neon.tech`。本地项目关联是离线写入的，需登录后验证，不能据此断言远端已配置。
-
-在项目根目录执行：
+需要 Node.js 22+。`npm ci --cache /workspace/.npm-cache` 后，复制 `.env.example` 为忽略的 `.env.local`，安全填写真实 Blob Token 及初始管理员变量，执行：
 
 ```bash
-# 在终端运行，并在浏览器中授权。无需将任何凭据发到聊天中。
-npm_config_cache=/workspace/.npm-cache npx --yes neon@latest login --config-dir /workspace/.neon-cli
-# 检查项目与分支，并部署 neon.ts；CLI 将连接变量写入忽略的 .env.local。
-npm_config_cache=/workspace/.npm-cache npx --yes neon@latest deploy --config-dir /workspace/.neon-cli
-# 仅初始化数据库表，不创建默认密码。
-node --env-file=.env.local scripts/migrate.mjs
-# 安全设置 ADMIN_USERNAME、ADMIN_PIN 后创建初始管理员。
 node --env-file=.env.local scripts/setup.mjs
+npm run dev
+npm test
 npm run build
 npm start
 ```
 
-应用运行使用池化 `DATABASE_URL`；初始化脚本优先使用 `DATABASE_URL_UNPOOLED`。保留 `pg` 驱动以支持现有事务，并通过 `@vercel/functions` 的 `attachDatabasePool` 管理 Vercel Fluid compute 上的连接池。
+没有 Blob 账号时，可在 `.env.local` 显式设置 **`BLOB_LOCAL_DIR`** 为仓库之外的本地目录（例如 `/workspace/anji-delivery-local`），并填写初始管理员变量。它是本地模拟器，使用文件锁和原子替换模拟版本写入；Vercel 中禁止启用该选项，也没有从云存储失败自动回退到本地的逻辑。
 
-实际端到端测试应在专用测试分支执行：用 Neon CLI 创建测试分支并获取其环境变量，启动连接该分支的应用，再执行 `node --env-file=.env.local tests/integration.mjs`（默认应用地址端口3000，可通过 `TEST_BASE_URL` 更改）。测试会创建和清理本次运行的账号及派送数据，不应在生产分支直接执行。测试后切回 production 并重新拉取环境变量。不要把 `.env.local` 或数据库密码提交到 GitHub；Vercel 中仍需单独配置环境变量，`neon deploy` 不会部署 Vercel 前端。
+`npm run test:integration` 自动创建独立临时目录、启动生产服务、验证登录/权限/Excel日期/扫描/并发/签收PDF/用户管理，并在完成后关闭服务、清理数据。先运行 `npm run build`。本地模拟器通过不表示真实 Blob Token 和云权限已经通过验证；上线后还需要执行真实导入、扫码、签收和下载验证。
 
-## 发货日期功能升级
+## 可选：将旧 PostgreSQL 数据迁移到 Blob
 
-已有部署必须在发布新代码前运行 `node --env-file=.env.local scripts/migrate.mjs`（在安全终端配置 Neon 直接连接 `DATABASE_URL_UNPOOLED`）。迁移可重复执行，新增包裹/签收的日期字段，并将重复判断升级为“发货日期 + 装车单号 + 托盘号”。历史记录及已生成 PDF 保持原样；没有日期的旧包裹归入“未标注日期（历史数据）”，仍可扫描签收。旧记录不能从现有字段可靠推算日期，请勿仅为补日期重复导入历史文件，以免创建新的日期批次；历史日期整理需按原文件核实。新导入的日期会出现在工作台、签收记录和新生成的 PDF 中，PDF 文件名规则不变。
+无需迁移空数据库。已有业务数据时，在可信终端中准备忽略的环境文件，配置：`LEGACY_DATABASE_URL`（旧数据库连接）、`BLOB_READ_WRITE_TOKEN`（Private Store）、**全新的 `BLOB_PREFIX`**。开发依赖 `pg` 仅用于此脚本，不参与应用运行。
+
+```bash
+node --env-file=.env.local scripts/import-postgres.mjs
+```
+
+脚本以只读事务读取旧数据，复制账号密码哈希、包裹、扫描记录及 PDF，保留ID，要求重新登录。目标前缀已有业务状态时拒绝覆盖。不会删除或修改旧数据库。完成后让 Vercel 使用迁移目标的 Store/前缀，核验数据再自行停用旧库。迁移和正常初始化不能同时进行；迁移失败可能留下未引用PDF，可换新前缀重试并核查旧前缀。不需要将旧数据库连接留在 Vercel 环境中。
+
+中文字体使用 Noto Sans CJK SC，许可见 `public/FONT-LICENSE.txt`。

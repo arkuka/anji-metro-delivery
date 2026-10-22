@@ -1,26 +1,136 @@
-import {pool} from '../../../lib/db.mjs';
-import {pinHash,pinVerify,rowsToParcels,filename,parseDispatchDate} from '../../../lib/domain.mjs';
+import {getStore,AppError,digest} from '../../../lib/storage.mjs';
+import {pinHash,pinVerify,rowsToParcels,filename,parseDispatchDate,ValidationError} from '../../../lib/domain.mjs';
 import {makePdf} from '../../../lib/pdf.mjs';
-import {randomBytes,createHash} from 'node:crypto';
+import {randomBytes} from 'node:crypto';
+import {BlobError} from '@vercel/blob';
 import ExcelJS from 'exceljs';
 export const runtime='nodejs';
-const hash=s=>createHash('sha256').update(s).digest('hex');
-const json=(v,status=200)=>Response.json(v,{status});
-async function handle(req,ctx){let client;try{const path=(await ctx.params).path.join('/');const method=req.method;
-if(method!=='GET'){const origin=req.headers.get('origin');if(origin&&origin!==new URL(req.url).origin)return json({error:'请求来源无效'},403);}
-if(path==='login'&&method==='POST'){const {username,pin}=await req.json();if(typeof username!=='string'||username.length>100)return json({error:'用户名或密码错误'},401);client=await pool.connect();await client.query('BEGIN');await client.query('INSERT INTO login_attempts(username) VALUES($1) ON CONFLICT DO NOTHING',[username]);const a=(await client.query('SELECT * FROM login_attempts WHERE username=$1 FOR UPDATE',[username])).rows[0];if(a.blocked_until&&new Date(a.blocked_until)>new Date()){await client.query('COMMIT');return json({error:'尝试过多，请15分钟后重试'},429);}const u=(await client.query('SELECT * FROM users WHERE username=$1',[username])).rows[0];if(!u||!pinVerify(String(pin),u.password)){await client.query("UPDATE login_attempts SET attempts=CASE WHEN blocked_until<now() THEN 1 ELSE attempts+1 END,blocked_until=CASE WHEN attempts>=4 THEN now()+interval '15 minutes' ELSE NULL END WHERE username=$1",[username]);await client.query('COMMIT');return json({error:'用户名或密码错误'},401);}await client.query('DELETE FROM login_attempts WHERE username=$1',[username]);const token=randomBytes(32).toString('hex');await client.query("INSERT INTO sessions VALUES($1,$2,now()+interval '12 hours')",[hash(token),u.id]);await client.query('COMMIT');return new Response(JSON.stringify({ok:true}),{headers:{'content-type':'application/json','set-cookie':`session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200${process.env.NODE_ENV==='production'?'; Secure':''}`}});}
-const token=req.headers.get('cookie')?.match(/(?:^|;\s*)session=([^;]+)/)?.[1]||'';
-const u=(await pool.query('SELECT u.id,u.username,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=$1 AND s.expires>now()',[hash(token)])).rows[0];if(!u)return json({error:'请先登录'},401);
-if(path==='me')return json(u);
-if(path==='logout'){await pool.query('DELETE FROM sessions WHERE token=$1',[hash(token)]);return new Response('{}',{headers:{'set-cookie':'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'}});}
-if(path==='password'&&method==='POST'){const b=await req.json();const old=(await pool.query('SELECT password FROM users WHERE id=$1',[u.id])).rows[0];if(!pinVerify(String(b.oldPin),old.password))return json({error:'原密码错误'},400);await pool.query('UPDATE users SET password=$1 WHERE id=$2',[pinHash(String(b.pin)),u.id]);await pool.query('DELETE FROM sessions WHERE user_id=$1 AND token<>$2',[u.id,hash(token)]);return json({ok:true});}
-if(path==='users'){if(u.role!=='admin')return json({error:'需要管理员权限'},403);if(method==='GET')return json((await pool.query('SELECT id,username,role FROM users ORDER BY id')).rows);const b=await req.json();if(method==='POST'){if(!/^[\p{L}\p{N}_-]{1,40}$/u.test(b.username)||!['admin','driver'].includes(b.role))throw Error('用户名或角色无效');await pool.query('INSERT INTO users(username,password,role) VALUES($1,$2,$3)',[b.username,pinHash(String(b.pin)),b.role]);}else{if(Number(b.id)===u.id)throw Error('请通过修改密码管理自己的账号');if(method==='DELETE')await pool.query('DELETE FROM users WHERE id=$1',[b.id]);if(method==='PATCH'){await pool.query('UPDATE users SET password=$1 WHERE id=$2',[pinHash(String(b.pin)),b.id]);await pool.query('DELETE FROM sessions WHERE user_id=$1',[b.id]);}}return json({ok:true});}
-if(path==='import'&&method==='POST'){if(u.role!=='admin')return json({error:'需要管理员权限'},403);const form=await req.formData();const file=form.get('file');if(!file||file.size>4*1024*1024)throw Error('请选择不超过4MB的xlsx文件');const wb=new ExcelJS.Workbook();await wb.xlsx.load(await file.arrayBuffer());const sheet=wb.worksheets[0];if(!sheet)throw Error('工作簿为空');const dateCell=sheet.getCell('C2');const dispatchDate=parseDispatchDate(dateCell.type===ExcelJS.ValueType.Formula?dateCell.result:dateCell.value,wb.properties.date1904);const rows=[];for(let i=1;i<=sheet.rowCount;i++){rows.push(Array.from({length:8},(_,j)=>sheet.getRow(i).getCell(j+1).text));}const parcels=rowsToParcels(rows);client=await pool.connect();await client.query('BEGIN');let inserted=0;for(const p of parcels){const r=await client.query('INSERT INTO parcels(sequence,dealer,pallet,order_no,area,address,load_no,dispatch_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING',[p.sequence,p.dealer,p.pallet,p.order,p.area,p.address,p.load,dispatchDate]);inserted+=r.rowCount;}await client.query('COMMIT');return json({dispatchDate,inserted,skipped:parcels.length-inserted});}
-if(path==='parcels'&&method==='GET')return json((await pool.query('SELECT p.*,COALESCE(p.scanner_name,u.username) AS driver_name FROM parcels p LEFT JOIN users u ON u.id=p.driver_id WHERE delivery_id IS NULL ORDER BY dispatch_date DESC NULLS LAST,dealer,id')).rows);
-if(path==='scan'&&method==='POST'){const {id,dealer,dispatchDate}=await req.json();const date=dispatchDate==='undated'?null:parseDispatchDate(dispatchDate);if(typeof dealer!=='string'||!dealer)throw Error('请先选择发货日期和Dealer');const r=await pool.query('UPDATE parcels SET scanned_at=COALESCE(scanned_at,now()),driver_id=COALESCE(driver_id,$1),scanner_name=COALESCE(scanner_name,$3) WHERE id=$2 AND delivery_id IS NULL AND dealer=$4 AND dispatch_date IS NOT DISTINCT FROM $5::text RETURNING *',[u.id,id,u.username,dealer,date]);if(!r.rowCount)throw Error('托盘已提交或不存在');return json(r.rows[0]);}
-if(path==='submit'&&method==='POST'){const b=await req.json();const dispatchDate=b.dispatchDate==='undated'?null:parseDispatchDate(b.dispatchDate);if(typeof b.signature!=='string'||!/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(b.signature)||b.signature.length>1000000)throw Error('请提供客户签名');client=await pool.connect();await client.query('BEGIN');const rows=(await client.query('SELECT * FROM parcels WHERE dealer=$1 AND dispatch_date IS NOT DISTINCT FROM $2::text AND delivery_id IS NULL ORDER BY id FOR UPDATE',[b.dealer,dispatchDate])).rows;if(!rows.length)throw Error('该Dealer没有待提交托盘');if(JSON.stringify(rows.map(r=>r.id))!==JSON.stringify(b.ids))throw Error('托盘列表已变化，请刷新后重新确认');if(rows.some(r=>!r.scanned_at)&&b.confirmMissing!==true)throw Error('仍有未扫描托盘，请明确确认派送失败');const time=new Date();const name=filename(b.dealer,time,process.env.APP_TIMEZONE||'Australia/Sydney');const pdf=await makePdf(b.dealer,rows,b.signature,u.username,time);const d=(await client.query('INSERT INTO deliveries(dealer,driver_id,driver_name,filename,pdf,created_at,dispatch_date) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id',[b.dealer,u.id,u.username,name,pdf,time,dispatchDate])).rows[0];await client.query('UPDATE parcels SET delivery_id=$1 WHERE id=ANY($2::int[])',[d.id,rows.map(r=>r.id)]);await client.query('COMMIT');return json({id:d.id,filename:name});}
-if(path==='deliveries'&&method==='GET')return json((await pool.query('SELECT id,dealer,dispatch_date,driver_name,created_at,filename FROM deliveries WHERE $1::boolean OR driver_id=$2 ORDER BY id DESC LIMIT 200',[u.role==='admin',u.id])).rows);
-if(/^pdf\/\d+$/.test(path)&&method==='GET'){const r=(await pool.query('SELECT * FROM deliveries WHERE id=$1 AND ($2::boolean OR driver_id=$3)',[path.split('/')[1],u.role==='admin',u.id])).rows[0];if(!r)return json({error:'文件不存在'},404);return new Response(r.pdf,{headers:{'Content-Type':'application/pdf','Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(r.filename)}`,'Cache-Control':'private, no-store'}});}
-return json({error:'接口不存在'},404);
-}catch(e){if(client)await client.query('ROLLBACK').catch(()=>{});console.error(e.code||e.message);return json({error:e.code==='23505'?'用户名已存在':e.code?'数据库操作失败，请检查服务配置':e.message},400);}finally{client?.release();}}
+export const maxDuration=60;
+const json=(value,status=200)=>Response.json(value,{status,headers:{'Cache-Control':'private, no-store'}});
+const publicUser=({id,username,role})=>({id,username,role});
+function userFor(state,token){
+  const session=state.sessions.find(s=>s.token===token&&new Date(s.expires)>new Date());
+  const user=session&&state.users.find(u=>u.id===session.user_id);
+  if(!user)throw new AppError('请先登录',401);return user;
+}
+const admin=user=>{if(user.role!=='admin')throw new AppError('需要管理员权限',403);};
+function selectedDate(value){return value==='undated'?null:parseDispatchDate(value);}
+const pending=(state,dealer,date)=>state.parcels.filter(p=>!p.delivery_id&&p.dealer===dealer&&p.dispatch_date===date).sort((a,b)=>a.id-b.id);
+
+async function handle(req,ctx){
+  try{
+    const path=(await ctx.params).path.join('/'),method=req.method;
+    if(method!=='GET'){const origin=req.headers.get('origin');if(origin&&origin!==new URL(req.url).origin)throw new AppError('请求来源无效',403);}
+    const store=await getStore();
+    if(path==='login'&&method==='POST'){
+      const {username,pin}=await req.json();
+      if(typeof username!=='string'||username.length>100)throw new AppError('用户名或密码错误',401);
+      const token=randomBytes(32).toString('hex');
+      const result=await store.transact(state=>{
+        let a=state.attempts.find(a=>a.username===username);
+        if(a?.blocked_until>Date.now())return {error:'尝试过多，请15分钟后重试',status:429};
+        const u=state.users.find(u=>u.username===username);
+        if(!u||!pinVerify(String(pin),u.password)){
+          if(!a){a={username,count:0};state.attempts.push(a);}
+          if(a.blocked_until){a.count=0;a.blocked_until=null;}
+          a.count++;a.updated_at=Date.now();if(a.count>=5)a.blocked_until=Date.now()+15*60*1000;
+          return {error:'用户名或密码错误',status:401};
+        }
+        state.attempts=state.attempts.filter(a=>a.username!==username);
+        state.sessions.push({token:digest(token),user_id:u.id,expires:new Date(Date.now()+12*3600000).toISOString()});
+        return {ok:true};
+      });
+      if(result.error)return json({error:result.error},result.status);
+      const response=json({ok:true});response.headers.set('set-cookie',`session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200${process.env.NODE_ENV==='production'?'; Secure':''}`);return response;
+    }
+    const token=digest(req.headers.get('cookie')?.match(/(?:^|;\s*)session=([^;]+)/)?.[1]||'');
+    const state=await store.read(),user=userFor(state,token);
+    // Authorization is checked again inside every CAS mutation, including retries.
+    const mutate=fn=>store.transact(s=>fn(s,userFor(s,token)));
+    if(path==='me'&&method==='GET')return json(publicUser(user));
+    if(path==='logout'&&method==='POST'){
+      await mutate(s=>{s.sessions=s.sessions.filter(x=>x.token!==token);});const response=json({ok:true});response.headers.set('set-cookie','session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');return response;
+    }
+    if(path==='password'&&method==='POST'){
+      const b=await req.json(),password=pinHash(String(b.pin));
+      await mutate((s,u)=>{if(!pinVerify(String(b.oldPin),u.password))throw new AppError('原密码错误');u.password=password;s.sessions=s.sessions.filter(x=>x.user_id!==u.id||x.token===token);});return json({ok:true});
+    }
+    if(path==='users'){
+      admin(user);if(method==='GET')return json(state.users.map(publicUser));
+      if(!['POST','PATCH','DELETE'].includes(method))throw new AppError('不支持此操作',405);
+      const b=await req.json();
+      const password=method==='DELETE'?null:pinHash(String(b.pin));
+      await mutate((s,u)=>{
+        admin(u);
+        if(method==='POST'){
+          if(!/^[\p{L}\p{N}_-]{1,40}$/u.test(b.username)||!['admin','driver'].includes(b.role))throw new AppError('用户名或角色无效');
+          if(s.users.some(x=>x.username===b.username))throw new AppError('用户名已存在');
+          s.users.push({id:++s.counters.users,username:b.username,password,role:b.role});
+        }else{
+          if(Number(b.id)===u.id)throw new AppError('请通过修改密码管理自己的账号');
+          const target=s.users.find(x=>x.id===Number(b.id));if(!target)throw new AppError('用户不存在',404);
+          if(method==='DELETE'){
+            s.users=s.users.filter(x=>x!==target);
+            for(const p of s.parcels)if(p.driver_id===target.id)p.driver_id=null;
+            for(const d of s.deliveries)if(d.driver_id===target.id)d.driver_id=null;
+          }else target.password=password;
+          s.sessions=s.sessions.filter(x=>x.user_id!==target.id);
+        }
+      });return json({ok:true});
+    }
+    if(path==='import'&&method==='POST'){
+      admin(user);const form=await req.formData(),file=form.get('file');
+      if(!file||typeof file.arrayBuffer!=='function'||file.size>4*1024*1024)throw new AppError('请选择不超过4MB的xlsx文件');
+      const bytes=Buffer.from(await file.arrayBuffer()),wb=new ExcelJS.Workbook();await wb.xlsx.load(bytes);
+      const sheet=wb.worksheets[0];if(!sheet)throw new AppError('工作簿为空');
+      const cell=sheet.getCell('C2'),dispatchDate=parseDispatchDate(cell.type===ExcelJS.ValueType.Formula?cell.result:cell.value,wb.properties.date1904);
+      const rows=[];for(let i=1;i<=sheet.rowCount;i++)rows.push(Array.from({length:8},(_,j)=>sheet.getRow(i).getCell(j+1).text));
+      const parcels=rowsToParcels(rows),source=digest(bytes);
+      const sourcePath=await store.writeFile('imports',bytes,'source.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      const result=await mutate((s,u)=>{
+        admin(u);let inserted=0;const keys=new Set(s.parcels.map(p=>JSON.stringify([p.dispatch_date,p.load_no,p.pallet])));
+        for(const p of parcels){const key=JSON.stringify([dispatchDate,p.load,p.pallet]);if(keys.has(key))continue;keys.add(key);s.parcels.push({id:++s.counters.parcels,sequence:p.sequence,dealer:p.dealer,pallet:p.pallet,order_no:p.order,area:p.area,address:p.address,load_no:p.load,dispatch_date:dispatchDate,scanned_at:null,driver_id:null,scanner_name:null,delivery_id:null});inserted++;}
+        if(!s.imports.some(x=>x.source===source))s.imports.push({source,pathname:sourcePath,dispatch_date:dispatchDate,uploaded_by:u.username,uploaded_at:new Date().toISOString()});
+        return {dispatchDate,inserted,skipped:parcels.length-inserted};
+      });return json(result);
+    }
+    if(path==='parcels'&&method==='GET')return json(state.parcels.filter(p=>!p.delivery_id).sort((a,b)=>(b.dispatch_date||'').localeCompare(a.dispatch_date||'')||a.dealer.localeCompare(b.dealer)||a.id-b.id).map(p=>({...p,driver_name:p.scanner_name||null})));
+    if(path==='scan'&&method==='POST'){
+      const b=await req.json(),date=selectedDate(b.dispatchDate);
+      if(typeof b.dealer!=='string'||!b.dealer)throw new AppError('请先选择发货日期和Dealer');
+      return json(await mutate((s,u)=>{const p=pending(s,b.dealer,date).find(p=>p.id===Number(b.id));if(!p)throw new AppError('托盘已提交或不存在');if(!p.scanned_at){p.scanned_at=new Date().toISOString();p.driver_id=u.id;p.scanner_name=u.username;}return {...p};}));
+    }
+    if(path==='submit'&&method==='POST'){
+      const b=await req.json(),dispatchDate=selectedDate(b.dispatchDate);
+      if(typeof b.signature!=='string'||!/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(b.signature)||b.signature.length>1000000)throw new AppError('请提供客户签名');
+      const result=await mutate(async(s,u)=>{
+        const rows=pending(s,b.dealer,dispatchDate);
+        if(!rows.length)throw new AppError('该Dealer没有待提交托盘');
+        if(JSON.stringify(rows.map(r=>r.id))!==JSON.stringify(b.ids))throw new AppError('托盘列表已变化，请刷新后重新确认');
+        if(rows.some(r=>!r.scanned_at)&&b.confirmMissing!==true)throw new AppError('仍有未扫描托盘，请明确确认派送失败');
+        const time=new Date(),name=filename(b.dealer,time,process.env.APP_TIMEZONE||'Australia/Sydney');
+        const pdf=await makePdf(b.dealer,rows,b.signature,u.username,time);
+        const pdfPath=await store.writeFile('receipts',pdf,name,'application/pdf');
+        const id=++s.counters.deliveries;
+        s.deliveries.push({id,dealer:b.dealer,dispatch_date:dispatchDate,driver_id:u.id,driver_name:u.username,created_at:time.toISOString(),filename:name,pdf_path:pdfPath});
+        for(const p of rows)p.delivery_id=id;
+        return {id,filename:name};
+      });return json(result);
+    }
+    if(path==='deliveries'&&method==='GET')return json(state.deliveries.filter(d=>user.role==='admin'||d.driver_id===user.id).sort((a,b)=>b.id-a.id).slice(0,200).map(({pdf_path,...d})=>d));
+    if(/^pdf\/\d+$/.test(path)&&method==='GET'){
+      const d=state.deliveries.find(d=>d.id===Number(path.split('/')[1])&&(user.role==='admin'||d.driver_id===user.id));
+      if(!d)throw new AppError('文件不存在',404);const object=await store.readFile(d.pdf_path);if(!object)throw new AppError('签收PDF暂时不可用，请联系管理员',503);
+      return new Response(new Uint8Array(object.body),{headers:{'Content-Type':'application/pdf','Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(d.filename)}`,'Cache-Control':'private, no-store'}});
+    }
+    throw new AppError('接口不存在',404);
+  }catch(error){
+    // Never expose SDK error messages: storage URLs/tokens may be included.
+    if(error instanceof AppError)return json({error:error.message},error.status);
+    if(error instanceof ValidationError)return json({error:error.message},400);
+    console.error('Request failed:',error.name);
+    if(error instanceof BlobError||(error instanceof TypeError&&error.message==='fetch failed'))return json({error:'Blob 存储访问失败，请检查私有存储连接、Token 和服务配额'},503);
+    return json({error:'操作失败，请检查日期、Excel或签名文件是否有效'},400);
+  }
+}
 export const GET=handle;export const POST=handle;export const PATCH=handle;export const DELETE=handle;
