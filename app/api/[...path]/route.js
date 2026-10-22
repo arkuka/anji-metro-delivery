@@ -1,3 +1,4 @@
+import {hasAllowedOrigin} from '../../../lib/request-origin.mjs';
 import {getStore,AppError,digest} from '../../../lib/storage.mjs';
 import {pinHash,pinVerify,rowsToParcels,filename,parseDispatchDate,ValidationError} from '../../../lib/domain.mjs';
 import {makePdf} from '../../../lib/pdf.mjs';
@@ -20,7 +21,7 @@ const pending=(state,dealer,date)=>state.parcels.filter(p=>!p.delivery_id&&p.dea
 async function handle(req,ctx){
   try{
     const path=(await ctx.params).path.join('/'),method=req.method;
-    if(method!=='GET'){const origin=req.headers.get('origin');if(origin&&origin!==new URL(req.url).origin)throw new AppError('请求来源无效',403);}
+    if(method!=='GET'&&!hasAllowedOrigin(req))throw new AppError('请求来源无效',403);
     const store=await getStore();
     if(path==='login'&&method==='POST'){
       const {username,pin}=await req.json();
