@@ -1,0 +1,4 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';import {pinHash,pinVerify,rowsToParcels,filename} from '../lib/domain.mjs';
+test('PIN validation, hashing and verification',()=>{const h=pinHash('0123');assert(pinVerify('0123',h));assert(!pinVerify('1234',h));assert.throws(()=>pinHash('12345'));assert.notEqual(h,pinHash('0123'));});
+test('Excel starts at row 9, preserves leading zeros, rejects invalid and duplicate pallets',()=>{const r=Array.from({length:8},()=>['ignored']);r.push(['1','001','2','0002','0003','东区','地址','L1']);assert.equal(rowsToParcels(r)[0].dealer,'001');assert.throws(()=>rowsToParcels([...r,r[8]]));assert.throws(()=>rowsToParcels([...r,['2','','','P','','','','']]));});
+test('PDF filename uses configured timezone and required format',()=>{assert.equal(filename('D01',new Date('2026-01-01T00:00:00Z'),'UTC'),'20260101-00:00:00-D01.PDF');});
