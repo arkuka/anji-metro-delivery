@@ -27,6 +27,11 @@ test('corrupt state is not silently replaced; exhausted conflicts fail without s
  let writes=0;
  const corrupt=createStore({read:async()=>({body:Buffer.from('{bad'),etag:'1'}),writeState:async()=>writes++},{seed:emptyState});
  await assert.rejects(corrupt.transact(()=>{}));assert.equal(writes,0);
- const backend={read:async()=>({body:Buffer.from(JSON.stringify(emptyState())),etag:'1'}),writeState:async()=>{throw Error('conflict');},isConflict:()=>true};
+ let revision=0;const backend={read:async()=>({body:Buffer.from(JSON.stringify(emptyState())),etag:String(++revision)}),writeState:async()=>{throw Error('conflict');},isConflict:()=>true};
  await assert.rejects(createStore(backend,{seed:emptyState,maxRetries:1}).transact(()=>{}),e=>e.status===409);
+});
+
+test('unchanged-version write rejection is diagnosed rather than blaming other drivers',async()=>{
+ const backend={read:async()=>({body:Buffer.from(JSON.stringify(emptyState())),etag:'unchanged'}),writeState:async()=>{throw Error('version mismatch');},isConflict:()=>true};
+ await assert.rejects(createStore(backend,{seed:emptyState,maxRetries:1}).transact(()=>{}),e=>e.status===503&&e.code==='BLOB_VERSION_MISMATCH');
 });

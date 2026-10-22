@@ -9,7 +9,8 @@ test('real Blob SDK uses private origin reads, conditional writes and private fi
  process.env.BLOB_READ_WRITE_TOKEN='vercel_blob_rw_teststore_synthetic_test_token';process.env.BLOB_PREFIX='test/v1';
  const object=mock.get('https://teststore.private.blob.vercel-storage.com'),api=mock.get('https://vercel.com');
  const state=Buffer.from(JSON.stringify(emptyState()));let reads=0;
- object.intercept({path:'/test/v1/state.json?cache=0',method:'GET'}).reply(options=>{reads++;assert(options.headers.authorization.startsWith('Bearer '));return {statusCode:200,data:state,responseOptions:{headers:{etag:'version-1','content-type':'application/json'}}};});
+ object.intercept({path:'/test/v1/state.json?cache=0',method:'GET'}).reply(options=>{reads++;assert(options.headers.authorization.startsWith('Bearer '));return {statusCode:200,data:state,responseOptions:{headers:{etag:'W/"download-tag"','content-type':'application/json'}}};});
+ function expectHead(etag){api.intercept({path:path=>path.startsWith('/api/blob?url='),method:'GET'}).reply(200,{url:'https://teststore.private.blob.vercel-storage.com/test/v1/state.json',pathname:'test/v1/state.json',etag});}
  function expectPut(etag){api.intercept({path:path=>path.startsWith('/api/blob'),method:'PUT'}).reply(options=>{
    const headers=new Headers(options.headers);
    assert.equal(headers.get('x-vercel-blob-access'),'private');
@@ -18,12 +19,26 @@ test('real Blob SDK uses private origin reads, conditional writes and private fi
    return {statusCode:200,data:JSON.stringify({url:'https://teststore.private.blob.vercel-storage.com/test/v1/state.json',downloadUrl:'https://teststore.private.blob.vercel-storage.com/test/v1/state.json',pathname:'test/v1/state.json',etag:'version-2'})};
  });}
  try{
-  const backend=blobBackend(),snapshot=await backend.read('state.json');assert.equal(snapshot.etag,'version-1');assert.deepEqual(snapshot.body,state);assert.equal(reads,1);
-  expectPut('version-1');await backend.writeState(state,'version-1');
+  expectHead('"metadata-v1"');expectHead('"metadata-v1"');
+  const backend=blobBackend(),snapshot=await backend.read('state.json');assert.equal(snapshot.etag,'"metadata-v1"');assert.deepEqual(snapshot.body,state);assert.equal(reads,1);
+  expectPut('"metadata-v1"');await backend.writeState(state,snapshot.etag);
+  api.intercept({path:path=>path.startsWith('/api/blob?url='),method:'GET'}).reply(404,{error:{code:'not_found'}});
+  assert.equal(await backend.read('state.json'),null);
   expectPut();await backend.writeState(state);
   api.intercept({path:path=>path.startsWith('/api/blob'),method:'PUT'}).reply(412,{error:{code:'precondition_failed'}});
   await assert.rejects(backend.writeState(state,'stale-etag'),error=>backend.isConflict(error));
   api.intercept({path:path=>path.startsWith('/api/blob'),method:'PUT'}).reply(options=>{const h=new Headers(options.headers);assert.equal(h.get('x-vercel-blob-access'),'private');return {statusCode:200,data:JSON.stringify({url:'https://teststore.private.blob.vercel-storage.com/test/v1/receipt.pdf',pathname:'test/v1/receipt.pdf',etag:'pdf-1'})};});
-  await backend.writeFile('receipt.pdf',Buffer.from('%PDF-fixture'),'application/pdf');mock.assertNoPendingInterceptors();
+  await backend.writeFile('receipt.pdf',Buffer.from('%PDF-fixture'),'application/pdf');
+  // A writer updates the state during a read. Discard those bytes and retry;
+  // never authorize a write of old bytes with the new metadata version.
+  const updated=Buffer.from(JSON.stringify({...emptyState(),counters:{users:0,parcels:7,deliveries:0}}));
+  expectHead('"before"');
+  object.intercept({path:'/test/v1/state.json?cache=0',method:'GET'}).reply(200,state,{headers:{etag:'W/"download-old"'}});
+  expectHead('"after"');
+  expectHead('"after"');
+  object.intercept({path:'/test/v1/state.json?cache=0',method:'GET'}).reply(200,updated,{headers:{etag:'W/"download-new"'}});
+  expectHead('"after"');
+  const consistent=await backend.read('state.json');assert.equal(consistent.etag,'"after"');assert.deepEqual(consistent.body,updated);
+  mock.assertNoPendingInterceptors();
  }finally{if(oldToken===undefined)delete process.env.BLOB_READ_WRITE_TOKEN;else process.env.BLOB_READ_WRITE_TOKEN=oldToken;if(oldPrefix===undefined)delete process.env.BLOB_PREFIX;else process.env.BLOB_PREFIX=oldPrefix;if(oldRetries===undefined)delete process.env.VERCEL_BLOB_RETRIES;else process.env.VERCEL_BLOB_RETRIES=oldRetries;setGlobalDispatcher(previous);await mock.close();}
 });

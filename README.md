@@ -17,7 +17,7 @@ Next.js 应用，使用 **Private Vercel Blob Store** 持久保存用户密码�
 
 - `<BLOB_PREFIX>/state.json` 是私有的业务状态，包含用户、会话、包裹、导入索引和签收索引。
 - `imports/<内容哈希>/source.xlsx` 保存原始 Excel；`receipts/<内容哈希>/<文件名>` 保存签名 PDF。全部是私有对象，浏览器通过鉴权 API 下载 PDF，无法直接访问业务 JSON。
-- 每次状态读取使用 SDK `get(..., {access:'private',useCache:false})` 从源站获取最新 ETag。写入使用 `put(...,{ifMatch:etag})`；新状态使用 `allowOverwrite:false`，并发冲突会重读并重试，超过上限返回409。整个扫描/签收事务在一个状态对象中提交，不会静默覆盖其他司机的记录。写入响应丢失时使用提交标识防止重复执行。
+- 每次业务状态读取先用 SDK `head()` 获取元数据 ETag，再用 `get(..., {access:'private',useCache:false})` 读取源站数据，最后再次 `head()` 确认版本未变。条件写入使用元数据 ETag，不依赖下载传输层可能不同的 ETag。写入使用 `put(...,{ifMatch:etag})`；新状态使用 `allowOverwrite:false`，并发冲突会重读并重试，超过上限返回409。整个扫描/签收事务在一个状态对象中提交，不会静默覆盖其他司机的记录。写入响应丢失时使用提交标识防止重复执行。
 - PDF 先上传成功，才提交签收索引与托盘状态。若上传失败，托盘不变；上传成功但状态冲突/失败，可能留下未引用的私有文件，不会生成错误的签收记录。备份或清理时须按 `state.json` 引用核对，不能按文件名盲删。
 - 这是面向小型派送团队的方案，每次修改需读写完整状态，操作量和费用随数据量增长。业务 JSON 上限20MB，PDF 和 Excel 独立存储；历史数据较多时需备份归档。操作密集时可能要求用户重试，不能保证任意并发量都能立即完成。
 
@@ -80,3 +80,5 @@ node --env-file=.env.local scripts/import-postgres.mjs
 ## 首页版本信息
 
 登录首页和登录后的工作台都显示系统版本、短提交号及更新时间。版本号来自 `package.json`；提交号优先使用 Vercel 的 `VERCEL_GIT_COMMIT_SHA`。更新时间在构建时生成，并以悉尼时区固定显示，刷新页面或导入 Excel 不会改变该时间。它表示当前部署的构建时间，不是包裹数据更新时间，无需额外配置环境变量。
+
+若登录提示 `BLOB_VERSION_MISMATCH`，表示写入被拒绝但未观察到元数据版本变化，不代表密码错误或其他司机正在操作。请在 Vercel Runtime Logs 按此错误代码定位；日志不包含 Token、密码或业务状态。真实并发冲突返回 `BLOB_CONCURRENT_UPDATE`。

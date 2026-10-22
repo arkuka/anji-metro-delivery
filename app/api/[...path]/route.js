@@ -126,7 +126,7 @@ async function handle(req,ctx){
     throw new AppError('接口不存在',404);
   }catch(error){
     // Never expose SDK error messages: storage URLs/tokens may be included.
-    if(error instanceof AppError)return json({error:error.message},error.status);
+    if(error instanceof AppError)return json({error:error.message,...(error.code?{code:error.code}:{})},error.status);
     if(error instanceof ValidationError)return json({error:error.message},400);
     console.error('Request failed:',error.name);
     if(error instanceof BlobError||(error instanceof TypeError&&error.message==='fetch failed'))return json({error:'Blob 存储访问失败，请检查私有存储连接、Token 和服务配额'},503);
