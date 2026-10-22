@@ -76,3 +76,7 @@ node --env-file=.env.local scripts/import-postgres.mjs
 登录显示“正在登录…”，密码格式错误、账号错误、网络故障和超时均显示明确提示。账号切换清空上一位用户的导航与列表，统一进入派送工作台；普通用户不会显示用户管理面板。若提示浏览器未保存会话，请允许 Cookie，并始终从同一个 HTTPS 网站地址登录。生产域名与预览域名如果连接了不同的 Blob Store/前缀，其账号数据也独立。
 
 `npm run build` 后执行 `npm run test:browser`，使用本地临时存储启动生产服务器，在手机和桌面尺寸回归“管理员创建用户 → 退出 → 新用户登录”的浏览器流程，并验证错误与加载提示。需要已安装 Chromium，默认路径 `/usr/bin/chromium`，可通过 `CHROMIUM_EXECUTABLE_PATH` 指定。测试账号和数据全部是临时的，不会修改真实 Blob Store。
+
+## 首页版本信息
+
+登录首页和登录后的工作台都显示系统版本、短提交号及更新时间。版本号来自 `package.json`；提交号优先使用 Vercel 的 `VERCEL_GIT_COMMIT_SHA`。更新时间在构建时生成，并以悉尼时区固定显示，刷新页面或导入 Excel 不会改变该时间。它表示当前部署的构建时间，不是包裹数据更新时间，无需额外配置环境变量。
